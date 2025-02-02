@@ -1125,9 +1125,11 @@ __device__ __forceinline__ void write_o_reg_gmem(
 template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
           uint32_t NUM_MMA_D_QK, uint32_t NUM_MMA_D_VO, uint32_t NUM_MMA_KV, uint32_t NUM_WARPS_Q,
           uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename AttentionVariant, typename Params>
-__global__
-__launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKVCacheKernel(
-    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+__device__ __inline__ void SinglePrefillWithKVCacheDevice(
+    const uint_fastdiv &group_size, const Params &params, uint8_t smem[], 
+    const uint32_t lane_idx, const uint32_t warp_idx, const uint32_t &bx, 
+    const uint32_t &chunk_idx, const uint32_t &kv_head_idx, const uint32_t num_kv_heads)
+{
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1154,9 +1156,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
-    const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>();
-    const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
-    const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+    const uint32_t num_qo_heads = num_kv_heads * group_size;
     constexpr uint32_t num_rows_per_cta = NUM_MMA_Q * NUM_WARPS_Q * 16;
 
     const uint32_t num_chunks = gridDim.y;
@@ -1167,7 +1167,6 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     const uint32_t chunk_size = chunk_end - chunk_start;
 
     auto block = cg::this_thread_block();
-    extern __shared__ uint8_t smem[];
     AttentionVariant variant(params, /*batch_idx=*/0, smem);
     const uint32_t window_left = variant.window_left;
 
@@ -1378,6 +1377,22 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
+}
+
+template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
+          uint32_t NUM_MMA_D_QK, uint32_t NUM_MMA_D_VO, uint32_t NUM_MMA_KV, uint32_t NUM_WARPS_Q,
+          uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename AttentionVariant, typename Params>
+__global__
+__launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKVCacheKernel(
+    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+
+    extern __shared__ uint8_t smem[];
+    const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>();
+    const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
+    const uint32_t num_kv_heads = gridDim.z;
+  SinglePrefillWithKVCacheDevice<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
+    NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, DTypeQKAccum, AttentionVariant>
+    (group_size, params, smem, lane_idx, warp_idx, bx, chunk_idx, kv_head_idx, num_kv_heads);
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,

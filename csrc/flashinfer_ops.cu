@@ -125,6 +125,13 @@ void BatchPrefillWithPagedKVCacheRun(
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
     int32_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
+//========== pod-attention =========
+void pod_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
+    at::Tensor o, std::optional<at::Tensor> maybe_lse,
+    unsigned int mask_mode_code, unsigned int layout,
+    int32_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS,
+    int64_t cuda_stream);
+
 //========== quantization ==========
 
 void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
@@ -240,6 +247,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("batch_prefill_with_kv_cache_plan", &BatchPrefillWithKVCachePlan);
   m.def("batch_prefill_with_ragged_kv_cache_run", &BatchPrefillWithRaggedKVCacheRun);
   m.def("batch_prefill_with_paged_kv_cache_run", &BatchPrefillWithPagedKVCacheRun);
+
+  // pod
+  m.def("pod_with_kv_cache", &pod_with_kv_cache,
+        "Hybrid batch POD-Attention with KV-Cache operator");
 
   // quantization
   m.def("packbits", &packbits, "GPU packbits operator");

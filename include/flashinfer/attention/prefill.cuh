@@ -1864,9 +1864,10 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
 template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
           uint32_t NUM_MMA_D_QK, uint32_t NUM_MMA_D_VO, uint32_t NUM_MMA_KV, uint32_t NUM_WARPS_Q,
           uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename AttentionVariant, typename Params>
-__global__
-__launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPagedKVCacheKernel(
-    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+    const uint_fastdiv group_size, const Params params, uint8_t smem[],
+    const dim3 tid = threadIdx, const uint32_t bx = blockIdx.x, 
+    const uint32_t kv_head_idx = blockIdx.z, const uint32_t num_kv_heads = gridDim.z) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1894,17 +1895,15 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     auto block = cg::this_thread_block();
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
-    const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x,
-                   warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.y, threadIdx.z), kv_head_idx = blockIdx.z;
+    const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>(tid.y, tid.z);
     if (block_valid_mask && !block_valid_mask[bx]) {
       return;
     }
-    const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+    const uint32_t num_qo_heads = num_kv_heads * group_size;
 
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = NUM_MMA_Q * NUM_WARPS_Q * 16;
-    extern __shared__ uint8_t smem[];
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
@@ -1938,7 +1937,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     init_states<NUM_MMA_Q, NUM_MMA_D_VO>(variant, o_frag, m, d);
 
     const uint32_t qo_packed_idx_base =
-        (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.y)) * NUM_MMA_Q * 16;
+        (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<NUM_WARPS_Q, NUM_WARPS_KV>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
     smem_t<swizzle_mode_q> qo_smem(smem);
@@ -1953,12 +1952,12 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
             : o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h +
                   (lane_idx % 8) * upcast_size<DTypeO>();
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<upcast_head_dim_q>(
-        get_warp_idx_q<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.y) * NUM_MMA_Q * 16 + lane_idx % 16,
+        get_warp_idx_q<NUM_WARPS_Q, NUM_WARPS_KV>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16,
         lane_idx / 16);
 
     load_q_global_smem<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D_QK>(
         qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n, q_stride_h, group_size,
-        &qo_smem, threadIdx);
+        &qo_smem, tid);
 
     cp_async::commit_group();
     cp_async::wait_group<0>();
@@ -1982,7 +1981,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
       block.sync();
     }
     q_smem_inplace_transform<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D_VO, swizzle_mode_q>(
-        params, variant, &qo_smem, threadIdx);
+        params, variant, &qo_smem, tid);
 
     constexpr SwizzleMode swizzle_mode_kv =
         (sizeof(DTypeKV) == 1 && head_dim_vo == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
@@ -1995,11 +1994,11 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     size_t kv_offset[NUM_MMA_KV * (swizzle_mode_kv == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q];
 
     uint32_t k_smem_offset_r = k_smem.get_permuted_offset<upcast_head_dim_k>(
-                 get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.z) * NUM_MMA_KV * 16 +
+                 get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(tid.z) * NUM_MMA_KV * 16 +
                      8 * (lane_idx / 16) + lane_idx % 8,
                  (lane_idx % 16) / 8),
              v_smem_offset_r = v_smem.get_permuted_offset<upcast_head_dim_v>(
-                 get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.z) * NUM_MMA_KV * 16 + lane_idx % 16,
+                 get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
                  lane_idx / 16),
              k_smem_offset_w = k_smem.get_permuted_offset<upcast_head_dim_k>(
                  warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols),
@@ -2022,10 +2021,10 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
           last_indptr);
     }
     page_produce_kv<false, NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D_QK, NUM_MMA_KV>(
-        k_smem, &k_smem_offset_w, paged_kv, 0, kv_offset, chunk_size, threadIdx);
+        k_smem, &k_smem_offset_w, paged_kv, 0, kv_offset, chunk_size, tid);
     cp_async::commit_group();
     page_produce_kv<true, NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D_VO, NUM_MMA_KV>(
-        v_smem, &v_smem_offset_w, paged_kv, 0, kv_offset, chunk_size, threadIdx);
+        v_smem, &v_smem_offset_w, paged_kv, 0, kv_offset, chunk_size, tid);
     cp_async::commit_group();
 
     const uint32_t num_iterations = ceil_div(
@@ -2083,17 +2082,17 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
 
       logits_transform<NUM_MMA_Q, NUM_MMA_KV>(
           params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.z)) *
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(tid.z)) *
                             NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, threadIdx);
+          qo_len, kv_len, group_size, s_frag, tid);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
         logits_mask<MASK_MODE, NUM_MMA_Q, NUM_MMA_KV>(
             params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.z)) *
+            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(tid.z)) *
                               NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, kv_head_idx, threadIdx);
+            qo_len, kv_len, chunk_end, group_size, s_frag, kv_head_idx, tid);
       }
 
       // compute m,d states in online softmax
@@ -2102,7 +2101,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
       block.sync();
       page_produce_kv<false, NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D_QK, NUM_MMA_KV>(
           k_smem, &k_smem_offset_w, paged_kv, (iter + 1) * 16 * NUM_WARPS_KV * NUM_MMA_KV,
-          kv_offset, chunk_size, threadIdx);
+          kv_offset, chunk_size, tid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
@@ -2114,7 +2113,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
       block.sync();
       page_produce_kv<true, NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D_VO, NUM_MMA_KV>(
           v_smem, &v_smem_offset_w, paged_kv, (iter + 1) * 16 * NUM_WARPS_KV * NUM_MMA_KV,
-          kv_offset, chunk_size, threadIdx);
+          kv_offset, chunk_size, tid);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
@@ -2122,7 +2121,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
 
     // threadblock synchronization
     threadblock_sync_mdo_states<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D_VO, DTypeQKAccum>(
-        variant, o_frag, (float*)smem, m, d, warp_idx, lane_idx, threadIdx);
+        variant, o_frag, (float*)smem, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
     normalize_d<NUM_MMA_Q, NUM_MMA_D_VO>(variant, o_frag, m, d);
@@ -2134,12 +2133,12 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
         o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
         /*o_stride_n=*/
         partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
-        /*o_stride_h=*/o_stride_h, group_size, threadIdx);
+        /*o_stride_h=*/o_stride_h, group_size, tid);
 
     // write lse
     if constexpr (variant.use_softmax) {
       if (lse != nullptr) {
-        if (get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(threadIdx.z) == 0) {
+        if (get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>(tid.z) == 0) {
 #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -2166,6 +2165,19 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
+}
+
+template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
+          uint32_t NUM_MMA_D_QK, uint32_t NUM_MMA_D_VO, uint32_t NUM_MMA_KV, uint32_t NUM_WARPS_Q,
+          uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename AttentionVariant, typename Params>
+__global__
+__launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPagedKVCacheKernel(
+    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BatchPrefillWithPagedKVCacheDevice<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q,
+      NUM_MMA_D_QK, NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, 
+      DTypeQKAccum, AttentionVariant, Params> 
+    (group_size, params, smem);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,

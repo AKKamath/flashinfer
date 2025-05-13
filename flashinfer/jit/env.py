@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import pathlib
 import re
 import warnings
@@ -32,8 +33,11 @@ def _get_workspace_dir_name() -> pathlib.Path:
         arch = "_".join(sorted(set(re.findall(r"compute_(\d+)", "".join(flags)))))
     except Exception:
         arch = "noarch"
+    flashinfer_base = os.getenv(
+        "FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix()
+    )
     # e.g.: $HOME/.cache/flashinfer/75_80_89_90/
-    return pathlib.Path.home() / ".cache" / "flashinfer" / arch
+    return pathlib.Path(flashinfer_base) / ".cache" / "flashinfer" / arch
 
 
 # use pathlib
@@ -43,6 +47,7 @@ FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
 _package_root = pathlib.Path(__file__).resolve().parents[1]
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
+# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
